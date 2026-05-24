@@ -1,0 +1,55 @@
+# Binaries
+bin/
+/control-plane
+/runner
+/cmd/control-plane/control-plane
+/cmd/runner/runner
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.txt
+
+# Node
+node_modules/
+.next/
+out/
+
+# Playwright
+cmd/runner/playwright-project/test-results/
+cmd/runner/playwright-project/playwright-report/
+cmd/runner/playwright-project/blob-report/
+cmd/runner/playwright-project/.playwright/
+
+# Logs
+*.log
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+docker-compose.override.yml
+
+# Operator-supplied TLS material for pgmqtt Enterprise WSS (deploy/docker-compose.enterprise.yml)
+deploy/certs/

@@ -1,0 +1,7 @@
+{
+  "name": "replay-playwright",
+  "version": "1.0.0",
+  "dependencies": {
+    "@playwright/test": "1.50.0"
+  }
+}

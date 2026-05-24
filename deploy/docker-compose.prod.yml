@@ -1,0 +1,52 @@
+# Production overlay. Compose with the base file:
+#
+#   docker compose -f docker-compose.yml -f deploy/docker-compose.prod.yml up -d
+#
+# Replay does not ship a TLS-terminating ingress. Put your own reverse proxy /
+# load balancer in front (nginx, Traefik, an ALB, …) and point it at the
+# loopback-published ports below. Your proxy is responsible for:
+#   - terminating TLS for the UI, the control-plane API, and the artifacts host;
+#   - proxying /mqtt -> pgmqtt:9001 (browser MQTT-over-WebSocket); and
+#   - preserving the Host header for the artifacts (MinIO) vhost — S3 presigned
+#     URLs are signed against Host, so a path prefix or rewritten Host breaks
+#     signature verification. Give MinIO its own name and pass Host through.
+#
+# Every service stays bound to 127.0.0.1 (inherited from the base file) so a
+# host-level proxy can reach them without exposing anything on a public
+# interface. If your proxy runs off-host, re-publish the ports you need on a
+# private interface here.
+#
+# What this overlay changes vs the base file:
+#   - restart: always on every long-running service.
+#   - REPLAY_COOKIE_SECURE=true (session cookies only sent over HTTPS).
+#   - Wires the UI's MQTT URL to the public wss endpoint your proxy serves.
+
+services:
+  pgmqtt:
+    restart: always
+
+  minio:
+    restart: always
+
+  control-plane:
+    restart: always
+    environment:
+      REPLAY_COOKIE_SECURE: "true"
+
+  runner:
+    restart: always
+
+  ui:
+    restart: always
+    build:
+      # Production build: `next build` + `next start` (the base file uses the
+      # `dev` target = `next dev`). NEXT_PUBLIC_* are inlined into the client
+      # bundle at build time, so the browser's broker URL is a build arg here,
+      # not a runtime env var. Browser dials wss://{domain}/mqtt — your proxy
+      # must route /mqtt to pgmqtt:9001. Rebuild the image (`up -d --build ui`)
+      # if you change REPLAY_DOMAIN.
+      target: prod
+      args:
+        NEXT_PUBLIC_MQTT_WS_URL: wss://${REPLAY_DOMAIN}/mqtt
+    environment:
+      CONTROL_PLANE_URL: http://control-plane:8080

@@ -1,0 +1,62 @@
+# Enterprise overlay — layers on top of the prod overlay to switch browser→broker
+# from "SCRAM + a /mqtt proxy in front" to "JWT direct to pgmqtt's native WSS
+# listener". The browser dials pgmqtt's WSS on :9002 directly, so your reverse
+# proxy no longer needs to carry the /mqtt WebSocket at all.
+#
+# Must be applied AFTER the prod overlay; it only adjusts a handful of env vars
+# and exposes pgmqtt's WSS port. Three things move together — keep them coupled
+# or live MQTT silently breaks:
+#   1. Browser URL  (ui.NEXT_PUBLIC_MQTT_WS_URL = wss://…:9002/mqtt)
+#   2. pgmqtt boot  (REPLAY_PGMQTT_LICENSE_KEY + cert + WSS:9002 listener)
+#   3. Your proxy   (stops needing a /mqtt route)
+#
+#   docker compose \
+#     -f docker-compose.yml \
+#     -f deploy/docker-compose.prod.yml \
+#     -f deploy/docker-compose.enterprise.yml \
+#     up -d
+#
+# Required env (set in .env alongside the Production overrides block):
+#   REPLAY_MQTT_TRUSTED_BROKER=true
+#   REPLAY_BROKER_JWT_PRIVATE_KEY=<from `control-plane gen-broker-jwt-key`>
+#   REPLAY_PGMQTT_LICENSE_KEY=<your pgmqtt Enterprise license>
+#   REPLAY_PGMQTT_TLS_CERT_FILE=/certs/cert.crt
+#   REPLAY_PGMQTT_TLS_KEY_FILE=/certs/cert.key
+#   NEXT_PUBLIC_MQTT_WS_URL=wss://${REPLAY_DOMAIN}:9002/mqtt
+#
+# TLS material: pgmqtt terminates its own TLS on :9002, so it needs a cert for
+# REPLAY_DOMAIN. Drop a cert.crt + cert.key into ./deploy/certs (bind-mounted
+# read-only at /certs below) — issue them however you already manage certs for
+# your reverse proxy (your ACME client, your LB, etc.). After first boot pgmqtt
+# needs a restart for the WSS listener to bind:
+#   docker compose ... restart pgmqtt
+# Restart it again whenever you rotate the cert files.
+
+services:
+  pgmqtt:
+    volumes:
+      - ./deploy/certs:/certs:ro
+    ports:
+      - "9002:9002"
+    environment:
+      # pgmqtt reads these via the autoconfig path in control-plane; passing
+      # them on the broker container too is informational, useful for `docker
+      # compose exec pgmqtt env | grep PGMQTT` when debugging.
+      PGMQTT_LICENSE_KEY: ${REPLAY_PGMQTT_LICENSE_KEY:-}
+
+  control-plane:
+    environment:
+      REPLAY_MQTT_TRUSTED_BROKER: "true"
+      REPLAY_BROKER_JWT_PRIVATE_KEY: ${REPLAY_BROKER_JWT_PRIVATE_KEY}
+      REPLAY_PGMQTT_LICENSE_KEY: ${REPLAY_PGMQTT_LICENSE_KEY}
+      REPLAY_PGMQTT_TLS_CERT_FILE: ${REPLAY_PGMQTT_TLS_CERT_FILE:-/certs/cert.crt}
+      REPLAY_PGMQTT_TLS_KEY_FILE: ${REPLAY_PGMQTT_TLS_KEY_FILE:-/certs/cert.key}
+
+  ui:
+    build:
+      # Browser dials pgmqtt's WSS listener directly. The prod overlay's default
+      # build arg of wss://{domain}/mqtt is overridden here. NEXT_PUBLIC_* are
+      # inlined at build time, so this is a build arg, not a runtime env var —
+      # rebuild the ui image (`up -d --build ui`) after changing it.
+      args:
+        NEXT_PUBLIC_MQTT_WS_URL: wss://${REPLAY_DOMAIN}:9002/mqtt
