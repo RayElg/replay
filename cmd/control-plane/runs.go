@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"log/slog"
@@ -11,6 +12,25 @@ import (
 	"github.com/google/uuid"
 	"github.com/minio/minio-go/v7"
 )
+
+// ownedByWorkspace reports whether id exists in the given table within
+// workspaceID. table is an internal literal; switching over it keeps the SQL
+// static. A malformed id errors the query and reads as "not owned".
+func ownedByWorkspace(ctx context.Context, db *sql.DB, table, id, workspaceID string) bool {
+	var q string
+	switch table {
+	case "scripts":
+		q = `SELECT 1 FROM scripts WHERE id = $1 AND workspace_id = $2`
+	case "environments":
+		q = `SELECT 1 FROM environments WHERE id = $1 AND workspace_id = $2`
+	case "runs":
+		q = `SELECT 1 FROM runs WHERE id = $1 AND workspace_id = $2`
+	default:
+		return false
+	}
+	var one int
+	return db.QueryRowContext(ctx, q, id, workspaceID).Scan(&one) == nil
+}
 
 type RunRequest struct {
 	ProjectID  string            `json:"project_id"`
@@ -31,6 +51,25 @@ func registerRunRoutes(r chi.Router, db *sql.DB, s3 *minio.Client, bucket string
 			http.Error(w, "invalid request", http.StatusBadRequest)
 			return
 		}
+
+		workspaceID := workspaceFromContext(r.Context())
+		projectID := projectIDFromContext(r.Context())
+
+		// Referenced script/env/root-run must belong to this workspace — the
+		// runner fetches them by id, so an unchecked id is a cross-tenant read.
+		if req.ScriptID != "" && !ownedByWorkspace(r.Context(), db, "scripts", req.ScriptID, workspaceID) {
+			http.Error(w, "script_id not found in this workspace", http.StatusBadRequest)
+			return
+		}
+		if req.EnvID != "" && !ownedByWorkspace(r.Context(), db, "environments", req.EnvID, workspaceID) {
+			http.Error(w, "env_id not found in this workspace", http.StatusBadRequest)
+			return
+		}
+		if req.RootRunID != "" && !ownedByWorkspace(r.Context(), db, "runs", req.RootRunID, workspaceID) {
+			http.Error(w, "root_run_id not found in this workspace", http.StatusBadRequest)
+			return
+		}
+
 		runID := uuid.New().String()
 
 		var rootRunID interface{}
@@ -60,7 +99,7 @@ func registerRunRoutes(r chi.Router, db *sql.DB, s3 *minio.Client, bucket string
 		_, err := db.ExecContext(r.Context(),
 			`INSERT INTO runs (id, project_id, workspace_id, root_run_id, branch, commit_sha, repo, test_filter, script_id, env_id, env_vars, status)
 			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'queued')`,
-			runID, projectIDFromContext(r.Context()), workspaceFromContext(r.Context()),
+			runID, projectID, workspaceID,
 			rootRunID, req.Branch, req.CommitSHA, repoVal, req.TestFilter, scriptID, envID, envVarsJSON,
 		)
 		if err != nil {
