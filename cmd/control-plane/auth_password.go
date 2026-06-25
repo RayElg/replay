@@ -124,6 +124,12 @@ var (
 const (
 	loginMaxAttempts = 5
 	loginWindow      = 5 * time.Minute
+
+	// Per-email backstop, independent of IP: the per-(email,IP) limit above is
+	// bypassable by spoofing X-Forwarded-For (a fresh bucket per forged IP). Set
+	// high enough that shared-NAT users and password typos don't trip it.
+	loginMaxAttemptsPerEmail = 50
+	loginWindowPerEmail      = 15 * time.Minute
 )
 
 // loginAttemptKey combines email + IP so a single shared IP doesn't lock
@@ -131,7 +137,10 @@ const (
 // the limit.
 func loginAttemptKey(email, ip string) string { return strings.ToLower(email) + "|" + ip }
 
-func recordLoginAttempt(key string) (allowed bool, retryAfter time.Duration) {
+// recordLoginAttempt records one attempt against key and reports whether it is
+// still under max within window. Callers namespace keys ("ip:"/"email:") so the
+// two limiters share one map.
+func recordLoginAttempt(key string, max int, window time.Duration) (allowed bool, retryAfter time.Duration) {
 	loginAttemptsMu.Lock()
 	defer loginAttemptsMu.Unlock()
 	now := time.Now()
@@ -141,7 +150,7 @@ func recordLoginAttempt(key string) (allowed bool, retryAfter time.Duration) {
 		loginAttempts[key] = a
 	}
 	// Drop entries outside the window.
-	cut := now.Add(-loginWindow)
+	cut := now.Add(-window)
 	keep := a.timestamps[:0]
 	for _, t := range a.timestamps {
 		if t.After(cut) {
@@ -149,11 +158,48 @@ func recordLoginAttempt(key string) (allowed bool, retryAfter time.Duration) {
 		}
 	}
 	a.timestamps = keep
-	if len(a.timestamps) >= loginMaxAttempts {
-		return false, loginWindow - now.Sub(a.timestamps[0])
+	if len(a.timestamps) >= max {
+		return false, window - now.Sub(a.timestamps[0])
 	}
 	a.timestamps = append(a.timestamps, now)
 	return true, 0
+}
+
+// pruneAuthMemory bounds the in-process touch-debounce and login-attempt maps,
+// which otherwise grow with every distinct session id / login key. Called from
+// gcSessions' hourly tick.
+func pruneAuthMemory() {
+	now := time.Now()
+
+	touchedSessionsMu.Lock()
+	for sid, last := range touchedSessions {
+		if now.Sub(last) > time.Minute {
+			delete(touchedSessions, sid)
+		}
+	}
+	touchedSessionsMu.Unlock()
+
+	// Widest login window governs when an attempt record can still count.
+	maxWindow := loginWindow
+	if loginWindowPerEmail > maxWindow {
+		maxWindow = loginWindowPerEmail
+	}
+	cut := now.Add(-maxWindow)
+	loginAttemptsMu.Lock()
+	for key, a := range loginAttempts {
+		keep := a.timestamps[:0]
+		for _, t := range a.timestamps {
+			if t.After(cut) {
+				keep = append(keep, t)
+			}
+		}
+		if len(keep) == 0 {
+			delete(loginAttempts, key)
+		} else {
+			a.timestamps = keep
+		}
+	}
+	loginAttemptsMu.Unlock()
 }
 
 func clearLoginAttempts(key string) {
@@ -199,8 +245,15 @@ func registerPasswordAuthRoutes(r chi.Router, db *sql.DB) {
 			return
 		}
 		ip := clientIP(req)
-		key := loginAttemptKey(body.Email, ip)
-		if ok, retry := recordLoginAttempt(key); !ok {
+		ipKey := "ip:" + loginAttemptKey(body.Email, ip)
+		emailKey := "email:" + body.Email // already lowercased+trimmed above
+		// Per-IP limit, then the per-email backstop (survives XFF spoofing).
+		if ok, retry := recordLoginAttempt(ipKey, loginMaxAttempts, loginWindow); !ok {
+			w.Header().Set("Retry-After", retry.Round(time.Second).String())
+			http.Error(w, "too many login attempts", http.StatusTooManyRequests)
+			return
+		}
+		if ok, retry := recordLoginAttempt(emailKey, loginMaxAttemptsPerEmail, loginWindowPerEmail); !ok {
 			w.Header().Set("Retry-After", retry.Round(time.Second).String())
 			http.Error(w, "too many login attempts", http.StatusTooManyRequests)
 			return
@@ -214,7 +267,8 @@ func registerPasswordAuthRoutes(r chi.Router, db *sql.DB) {
 			http.Error(w, "invalid credentials", http.StatusUnauthorized)
 			return
 		}
-		clearLoginAttempts(key)
+		clearLoginAttempts(ipKey)
+		clearLoginAttempts(emailKey)
 
 		sid, err := createUserSession(req.Context(), db, userID, workspaceID, req)
 		if err != nil {
@@ -506,6 +560,7 @@ func gcSessions(ctx context.Context, db *sql.DB) {
 			} else if n, _ := res.RowsAffected(); n > 0 {
 				slog.Info("gc: expired sessions cleared", "count", n)
 			}
+			pruneAuthMemory()
 		}
 	}
 }

@@ -31,7 +31,7 @@ func TestRecordLoginAttemptUnderThresholdAllows(t *testing.T) {
 	resetLoginAttempts(t)
 	key := "u@example.com|1.2.3.4"
 	for i := 0; i < loginMaxAttempts; i++ {
-		ok, retry := recordLoginAttempt(key)
+		ok, retry := recordLoginAttempt(key, loginMaxAttempts, loginWindow)
 		if !ok {
 			t.Fatalf("attempt %d should be allowed (max=%d)", i+1, loginMaxAttempts)
 		}
@@ -45,11 +45,11 @@ func TestRecordLoginAttemptBlocksAtThreshold(t *testing.T) {
 	resetLoginAttempts(t)
 	key := "u@example.com|1.2.3.4"
 	for i := 0; i < loginMaxAttempts; i++ {
-		if ok, _ := recordLoginAttempt(key); !ok {
+		if ok, _ := recordLoginAttempt(key, loginMaxAttempts, loginWindow); !ok {
 			t.Fatalf("attempt %d should still be allowed", i+1)
 		}
 	}
-	ok, retry := recordLoginAttempt(key)
+	ok, retry := recordLoginAttempt(key, loginMaxAttempts, loginWindow)
 	if ok {
 		t.Fatal("attempt at threshold+1 must be blocked")
 	}
@@ -61,15 +61,15 @@ func TestRecordLoginAttemptBlocksAtThreshold(t *testing.T) {
 func TestRecordLoginAttemptKeysAreIsolated(t *testing.T) {
 	resetLoginAttempts(t)
 	for i := 0; i < loginMaxAttempts; i++ {
-		recordLoginAttempt("a@x.com|1.2.3.4")
+		recordLoginAttempt("a@x.com|1.2.3.4", loginMaxAttempts, loginWindow)
 	}
-	if ok, _ := recordLoginAttempt("a@x.com|1.2.3.4"); ok {
+	if ok, _ := recordLoginAttempt("a@x.com|1.2.3.4", loginMaxAttempts, loginWindow); ok {
 		t.Fatal("first bucket should be exhausted")
 	}
-	if ok, _ := recordLoginAttempt("b@x.com|1.2.3.4"); !ok {
+	if ok, _ := recordLoginAttempt("b@x.com|1.2.3.4", loginMaxAttempts, loginWindow); !ok {
 		t.Fatal("different email on same IP should have its own bucket")
 	}
-	if ok, _ := recordLoginAttempt("a@x.com|9.9.9.9"); !ok {
+	if ok, _ := recordLoginAttempt("a@x.com|9.9.9.9", loginMaxAttempts, loginWindow); !ok {
 		t.Fatal("same email from different IP should have its own bucket")
 	}
 }
@@ -82,7 +82,7 @@ func TestRecordLoginAttemptSlidingWindow(t *testing.T) {
 	stale := time.Now().Add(-2 * loginWindow)
 	loginAttempts[key] = &loginAttempt{timestamps: []time.Time{stale, stale, stale, stale, stale}}
 	loginAttemptsMu.Unlock()
-	if ok, _ := recordLoginAttempt(key); !ok {
+	if ok, _ := recordLoginAttempt(key, loginMaxAttempts, loginWindow); !ok {
 		t.Fatal("entries outside the window must be dropped, freeing the slot")
 	}
 }
@@ -91,10 +91,10 @@ func TestClearLoginAttemptsResetsBucket(t *testing.T) {
 	resetLoginAttempts(t)
 	key := "u@x.com|1.2.3.4"
 	for i := 0; i < loginMaxAttempts; i++ {
-		recordLoginAttempt(key)
+		recordLoginAttempt(key, loginMaxAttempts, loginWindow)
 	}
 	clearLoginAttempts(key)
-	if ok, _ := recordLoginAttempt(key); !ok {
+	if ok, _ := recordLoginAttempt(key, loginMaxAttempts, loginWindow); !ok {
 		t.Fatal("clearLoginAttempts should let the next attempt through")
 	}
 }

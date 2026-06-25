@@ -23,7 +23,7 @@ services:
       - pgmqtt-data:/var/lib/postgresql/data
       - ./pgmqtt/02-create-replay-db.sh:/docker-entrypoint-initdb.d/02-create-replay-db.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}" ]
       interval: 2s
       timeout: 5s
       retries: 15
@@ -41,7 +41,7 @@ services:
     volumes:
       - minio-data:/data
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: [ "CMD", "mc", "ready", "local" ]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -116,6 +116,8 @@ services:
       RUNNER_DATABASE_URL: ${RUNNER_DATABASE_URL}
       RUNNER_OBJECT_STORE: ${RUNNER_OBJECT_STORE}
       RUNNER_CONCURRENCY: ${RUNNER_CONCURRENCY:-2}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
       # Runner needs the same encryption key(s) as control-plane to decrypt
       # env_vars values stored under the replaycrypto envelope.
       REPLAY_ENCRYPT_KEY: ${REPLAY_ENCRYPT_KEY:-}

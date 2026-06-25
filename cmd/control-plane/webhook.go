@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -52,8 +53,10 @@ func resolveWebhookProject(r *http.Request, db *sql.DB) (workspaceID, projectID 
 		slog.Warn("webhook: token lookup failed", "error", err)
 		return "", "", false
 	}
-	// Fallback: global token → default workspace's first project.
-	if g := globalWebhookToken(); g != "" && token == g {
+	// Fallback: global token → default workspace's first project. Constant-time
+	// digest compare so the global token isn't byte-by-byte guessable.
+	if g := globalWebhookToken(); g != "" &&
+		subtle.ConstantTimeCompare([]byte(hashWebhookToken(token)), []byte(hashWebhookToken(g))) == 1 {
 		pid, err := resolveDefaultProject(r.Context(), db, defaultWorkspaceID)
 		if err != nil {
 			return "", "", false
@@ -161,6 +164,20 @@ func registerWebhookRoutes(r chi.Router, db *sql.DB) {
 		// than an arbitrary pick.
 		var scriptID interface{}
 		if req.ScriptID != "" {
+			// Scope script_id to the token's workspace+project so a token can't
+			// run another tenant's script by id.
+			var one int
+			err := db.QueryRowContext(r.Context(),
+				`SELECT 1 FROM scripts WHERE id = $1 AND workspace_id = $2 AND project_id = $3`,
+				req.ScriptID, workspaceID, projectID).Scan(&one)
+			if err == sql.ErrNoRows {
+				http.Error(w, "script not found: "+req.ScriptID, http.StatusBadRequest)
+				return
+			}
+			if err != nil {
+				http.Error(w, "database error", http.StatusInternalServerError)
+				return
+			}
 			scriptID = req.ScriptID
 		} else if req.ScriptFilename != "" {
 			rows, err := db.QueryContext(r.Context(),

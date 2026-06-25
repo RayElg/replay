@@ -314,18 +314,20 @@ func initS3(storeURL string) (*minio.Client, string, error) {
 func executeJob(ctx context.Context, db *sql.DB, s3 *minio.Client, bucket string, job JobPayload, runnerID string) {
 	slog.Info("executing job", "run_id", job.RunID, "script_id", job.ScriptID)
 
-	// Only transition queued → running. If the user cancelled the run before we
-	// picked it up, the status is already 'cancelled' and we should skip execution
-	// entirely.
-	res, err := db.ExecContext(ctx,
-		`UPDATE runs SET status = 'running', started_at = NOW() WHERE id = $1 AND status = 'queued'`,
-		job.RunID)
-	if err != nil {
-		slog.Error("failed to update status", "run_id", job.RunID, "error", err)
+	// Only transition queued → running (skip if cancelled before pickup). Capture
+	// workspace_id here to scope the script/env lookups below to the run's tenant.
+	var workspaceID string
+	err := db.QueryRowContext(ctx,
+		`UPDATE runs SET status = 'running', started_at = NOW()
+		   WHERE id = $1 AND status = 'queued'
+		 RETURNING workspace_id`,
+		job.RunID).Scan(&workspaceID)
+	if err == sql.ErrNoRows {
+		slog.Info("skipping run; no longer queued (likely cancelled)", "run_id", job.RunID)
 		return
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		slog.Info("skipping run; no longer queued (likely cancelled)", "run_id", job.RunID)
+	if err != nil {
+		slog.Error("failed to update status", "run_id", job.RunID, "error", err)
 		return
 	}
 
@@ -340,18 +342,19 @@ func executeJob(ctx context.Context, db *sql.DB, s3 *minio.Client, bucket string
 	// Build env vars: environment-level base, then per-run overrides (run wins on conflict).
 	merged := map[string]string{}
 	var envSlug string
+	var decryptFailures []string
 
 	if envID != "" {
 		var varsJSON []byte
 		if err = db.QueryRowContext(ctx,
-			`SELECT env_vars, slug FROM environments WHERE id = $1`, envID,
+			`SELECT env_vars, slug FROM environments WHERE id = $1 AND workspace_id = $2`, envID, workspaceID,
 		).Scan(&varsJSON, &envSlug); err == nil {
 			var vars map[string]string
 			if json.Unmarshal(varsJSON, &vars) == nil {
 				for k, v := range vars {
 					plain, derr := decryptEnvVarValue(v)
 					if derr != nil {
-						slog.Warn("env var decrypt failed", "env_id", envID, "key", k, "error", derr)
+						decryptFailures = append(decryptFailures, k)
 						continue
 					}
 					merged[k] = plain
@@ -372,7 +375,7 @@ func executeJob(ctx context.Context, db *sql.DB, s3 *minio.Client, bucket string
 			for k, v := range runVars {
 				plain, derr := decryptEnvVarValue(v)
 				if derr != nil {
-					slog.Warn("run env var decrypt failed", "run_id", job.RunID, "key", k, "error", derr)
+					decryptFailures = append(decryptFailures, k)
 					continue
 				}
 				merged[k] = plain
@@ -380,6 +383,13 @@ func executeJob(ctx context.Context, db *sql.DB, s3 *minio.Client, bucket string
 		}
 	} else {
 		slog.Warn("failed to fetch run env_vars", "run_id", job.RunID, "error", err)
+	}
+
+	// Undecryptable values are dropped, not passed through as ciphertext. Surface
+	// it loudly — it's almost always a key mismatch with the control-plane.
+	if len(decryptFailures) > 0 {
+		slog.Error("runner could not decrypt env var(s); they were dropped — set REPLAY_ENCRYPT_KEY to match the control-plane (and REPLAY_ENCRYPT_KEY_PREVIOUS during rotation)",
+			"run_id", job.RunID, "count", len(decryptFailures), "vars", decryptFailures)
 	}
 
 	var envVars []string
@@ -401,7 +411,7 @@ func executeJob(ctx context.Context, db *sql.DB, s3 *minio.Client, bucket string
 
 	if scriptID != "" {
 		var content string
-		err = db.QueryRowContext(ctx, `SELECT content FROM scripts WHERE id = $1`, scriptID).Scan(&content)
+		err = db.QueryRowContext(ctx, `SELECT content FROM scripts WHERE id = $1 AND workspace_id = $2`, scriptID, workspaceID).Scan(&content)
 		if err != nil {
 			testResults = []TestResult{{Title: titleFor(job, scriptID), Status: "failed",
 				Logs: fmt.Sprintf("failed to fetch script %s: %v", scriptID, err)}}
@@ -496,6 +506,37 @@ func executeJob(ctx context.Context, db *sql.DB, s3 *minio.Client, bucket string
 	slog.Info("job finished", "run_id", job.RunID, "status", runStatus, "tests", len(testResults))
 }
 
+// baseRunnerEnv returns the minimal host env Playwright/npx needs, excluding the
+// runner's secrets. Allowlist (not denylist) so a future secret can't leak by
+// default. PLAYWRIGHT_* keeps the base image's browser-path vars; PATH+HOME let
+// npx find node and the pre-installed browsers.
+func baseRunnerEnv() []string {
+	allowExact := map[string]bool{
+		"PATH": true, "HOME": true, "USER": true, "LOGNAME": true, "SHELL": true,
+		"LANG": true, "TZ": true, "TERM": true, "TMPDIR": true,
+		"HOSTNAME": true, "PWD": true, "XDG_CACHE_HOME": true, "XDG_CONFIG_HOME": true,
+	}
+	allowPrefix := []string{"LC_", "PLAYWRIGHT_", "NODE_", "NPM_", "npm_"}
+	var out []string
+	for _, kv := range os.Environ() {
+		name, _, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
+		}
+		if allowExact[name] {
+			out = append(out, kv)
+			continue
+		}
+		for _, p := range allowPrefix {
+			if strings.HasPrefix(name, p) {
+				out = append(out, kv)
+				break
+			}
+		}
+	}
+	return out
+}
+
 // runScriptTest writes the user script to a temp file inside /playwright-project/tests/,
 // runs it via `npx playwright test --reporter=json`, parses per-test results from the
 // JSON report, and returns one TestResult per test spec.
@@ -519,7 +560,7 @@ func runScriptTest(ctx context.Context, scriptContent, runID string, envVars []s
 	cmd := exec.CommandContext(ctx, "npx", "playwright", "test", testFile,
 		"--output", outputDir, "--reporter=json")
 	cmd.Dir = projectDir
-	cmd.Env = append(os.Environ(), envVars...)
+	cmd.Env = append(baseRunnerEnv(), envVars...)
 	cmd.Env = append(cmd.Env, "PLAYWRIGHT_JSON_OUTPUT_NAME="+jsonResultPath)
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
